@@ -99,3 +99,123 @@ jobs:
         run: |
           ls -l dist
           gh release upload "$TAG" dist/*.zip --clobber --repo "$GITHUB_REPOSITORY"
+
+  report-failure:
+    name: Report failure
+    needs: [build, release]
+    if: always() && contains(needs.*.result, 'failure') && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      models: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect logs of failed jobs
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion == "failure")
+                  | "\(.id)\t\(.name)\t\([.steps[] | select(.conclusion == "failure") | .name] | join(", "))"' \
+            > failed.tsv
+          : > logs.txt
+          while IFS=$'\t' read -r id name steps; do
+            echo "===== $name (failed step: ${steps:-unknown}) =====" >> logs.txt
+            gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$id/logs" 2>/dev/null \
+              | sed -E 's/^[0-9-]+T[0-9:.]+Z //' | tail -n 100 >> logs.txt \
+              || echo "(log unavailable)" >> logs.txt
+          done < failed.tsv
+          cat failed.tsv
+
+      - name: Ask AI for a fix suggestion
+        continue-on-error: true
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          {
+            echo "You maintain SpoofVMM, a Lilu plugin kext built with a plain Makefile (no Xcode project)"
+            echo "on GitHub Actions macOS runners. A CI run failed. Identify the most likely root cause and"
+            echo "give a concrete fix: exact file edits (as diffs) or commands. Be concise. If the logs are"
+            echo "not enough to be sure, say so and list what to check."
+            echo; echo "--- Makefile ---"; cat Makefile
+            echo; echo "--- bootstrap.sh ---"; cat bootstrap.sh
+            echo; echo "--- .github/workflows/build.yml ---"; cat .github/workflows/build.yml
+            echo; echo "--- Failing job logs (tail) ---"; cat logs.txt
+          } | head -c 30000 > prompt.txt
+
+          if [ -n "$ANTHROPIC_API_KEY" ]; then
+            jq -n --rawfile p prompt.txt \
+              '{model: "claude-sonnet-5-5", max_tokens: 2000, messages: [{role: "user", content: $p}]}' > req.json
+            curl -fsS https://api.anthropic.com/v1/messages \
+              -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" \
+              -H "content-type: application/json" -d @req.json \
+              | jq -r '.content[] | select(.type == "text") | .text' > suggestion.md
+          else
+            jq -n --rawfile p prompt.txt \
+              '{model: "openai/gpt-4.1", messages: [{role: "user", content: $p}]}' > req.json
+            curl -fsS https://models.github.ai/inference/chat/completions \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Content-Type: application/json" -d @req.json \
+              | jq -r '.choices[0].message.content' > suggestion.md
+          fi
+
+      - name: Open or update the CI failure issue
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          {
+            echo "The **Build** workflow failed on \`$GITHUB_REF_NAME\` ($GITHUB_EVENT_NAME, commit $SHORT_SHA)."
+            echo
+            echo "Run: $RUN_URL"
+            echo
+            echo "**Failed jobs:**"
+            awk -F'\t' '{print "- " $2 " (step: " ($3 == "" ? "unknown" : $3) ")"}' failed.tsv
+            echo
+            if [ -s suggestion.md ]; then
+              echo "## Suggested fix"
+              echo "_AI-generated from the logs below. Check it before applying._"
+              echo
+              cat suggestion.md
+              echo
+            fi
+            echo "<details><summary>Log excerpt</summary>"
+            echo
+            echo '```'
+            tail -n 120 logs.txt
+            echo '```'
+            echo "</details>"
+          } | head -c 60000 > body.md
+
+          gh label create ci-failure --color B60205 \
+            --description "Automated CI failure report" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --label ci-failure --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --label ci-failure \
+              --title "CI failure on $GITHUB_REF_NAME ($SHORT_SHA)" --body-file body.md
+          fi
+
+  close-fixed-issues:
+    name: Close resolved failure issues
+    needs: [build, release]
+    if: >-
+      always() && github.event_name == 'push' &&
+      !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Close open ci-failure issues
+        run: |
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --label ci-failure --state open \
+                       --json number --jq '.[].number' 2>/dev/null); do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" \
+              --comment "Build is passing again on \`$GITHUB_REF_NAME\`: $RUN_URL"
+          done
