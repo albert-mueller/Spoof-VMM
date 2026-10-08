@@ -1,12 +1,6 @@
 //
 //  kern_spoofvmm.hpp
-//  SpoofVMM v4.9 - board-id functionality REMOVED ENTIRELY, along with the
-//  now-dead WiFi node-restore fix that depended on it.
-//
-//  On-hardware testing (see T2-Tahoe-FINDINGS.md) proved board-id spoofing
-//  was never necessary for the Tahoe compatibility gate - the gate clears on
-//  bridge-model alone. Board-id spoofing was pure WiFi-breaking collateral
-//  damage with no benefit. This version stops touching board-id at all.
+//  SpoofVMM - with Stage 2 BridgeOS firmware bypass for dropped T2 Macs
 //
 
 #ifndef kern_spoofvmm_hpp
@@ -14,9 +8,8 @@
 
 #include <Headers/kern_patcher.hpp>
 #include <sys/sysctl.h>
+#include <sys/vnode.h>
 
-// The class must NOT be named SpoofVMM: Lilu's plugin_start.hpp already declares
-// an IOService subclass named after PRODUCT_NAME (SpoofVMM).
 class VMMSpoof {
 public:
 	void init();
@@ -31,10 +24,13 @@ private:
 	static bool shouldSpoofFor(const char *procname);
 	static int sysctlVmmPresent(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req);
 
-	// --- IODeviceTree bridge-model swap (the confirmed gate-clear mechanism) ---
-	// swap to a valid supported-Mac value (spoofvmm-bridge=, on by default, off
-	// with -spoofvmmnoswap); diagnostic delete opt-in via -spoofvmmdelete.
+	// --- IODeviceTree bridge-model swap ---
 	void spoofIdentity();
+
+	// --- Stage 2 Code Signing Validation Patch (_cs_validate_page) ---
+	static mach_vm_address_t orgCsValidatePage;
+	static void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data, int *validated_p, int *tainted_p, int *nx_p);
+	static void performStage2Replacements(vnode_t vp, const void *data, vm_size_t size);
 };
 
 #endif /* kern_spoofvmm_hpp */

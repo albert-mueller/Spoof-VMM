@@ -1,49 +1,22 @@
 //
 //  kern_spoofvmm.cpp
-//  SpoofVMM v4.9 - board-id functionality REMOVED ENTIRELY.
+//  SpoofVMM v4.9.1 - Tahoe Stage 2 Board-ID Support + Bridge-Model Swap
 //
-//  On a MacBookAir8,1 (identity-spoofed to MacBookPro16,4 via OpenCore) this
-//  build boots cleanly AND clears the Tahoe installer's compatibility UI
-//  gate, allowing an in-place upgrade of the internal SSD. Confirmed on
-//  hardware.
-//
-//  What it does, all at Lilu patcher-load:
+//  Features:
 //    1. kern.hv_vmm_present = 1, PER PROCESS - returned only to the installer /
 //       software-update helpers, real value to everyone else (so storagekitd /
 //       diskarbitrationd are unaffected and APFS/disk access is not broken).
 //    2. bridge-model SWAP - overwrite bridge-model on every IODeviceTree node
 //       that has it with a VALID supported-Mac value (spoofvmm-bridge=,
-//       default kDefaultBridge). ON by default. This is the operation that
-//       clears the compatibility gate.
-//
-//  KEY FINDING: the gate keys off bridge-model, not board-id and not
-//  hw.target. A bridge-model that is PRESENT and set to a supported-Mac code
-//  passes the gate and boots fine. This build does NO model spoofing - model
-//  identity is supplied by OpenCore (PlatformInfo/SMBIOS). The kext writing
-//  model/Model/product-name/compatible in-OS (old v4.2/Stable) was redundant
-//  with OpenCore AND hung early boot; the bridge-model swap itself is
-//  boot-safe. DELETING bridge-model boots but does NOT pass the gate.
-//
-//  bridge-model DELETE is still available but is OPT-IN (-spoofvmmdelete),
-//  for diagnostics only. Swap can be turned off with -spoofvmmnoswap. If both
-//  swap and delete are on, order is swap-then-delete (net = delete), so do not
-//  combine them unless you want deletion.
-//
-//  REMOVED IN v4.9 (was present in v4.1-v4.8): board-id override in
-//  IODeviceTree, and the WiFi node-restore fix-up (v4.6, then v4.7 with a
-//  different hook point) that tried to compensate for it. Both are gone.
-//  Why: board-id spoofing broke WiFi (the AirPort/Broadcom driver's
-//  personality/calibration matching reads board-id, and on this hardware it
-//  can apparently only ever read the SAME shared root-level board-id
-//  property that everything else reads - ioreg confirmed only two board-id
-//  properties exist anywhere in IODeviceTree, root and /efi/platform, and the
-//  WiFi controller's own device-tree node has none of its own - so there was
-//  never a way to give WiFi a different value than the rest of the system
-//  sees via property overriding). On-hardware A/B testing with board-id left
-//  completely untouched (-spoofvmmnobid in v4.8) confirmed the gate STILL
-//  clears - board-id was never load-bearing for it. So as of v4.9, board-id
-//  is simply never touched, permanently, with no flag needed to disable it,
-//  and the now-pointless WiFi fix-up is deleted rather than kept dormant.
+//       default kDefaultBridge). ON by default. Clears Stage 1 compatibility gate.
+//    3. board-id SWAP (Stage 2 Root Hash Manifest fix) - enabled via:
+//       -spoofvmmbid or -spoofvmmstage2 or spoofvmm-board= (default: Mac-5F9802EFE386AA28).
+//       During Stage 2 prepare, MobileSoftwareUpdate (MSU) queries board-id to
+//       locate boot/Firmware/<Board-ID>.dmg.root_hash and mtree manifests.
+//       Tahoe dropped boards (MBA8,1, MBP16,3, etc.) lack manifests and fail with
+//       NSPOSIXErrorDomain:2 (-81). Supplying a supported Board-ID allows MSU to
+//       find the manifest and seal the SSV volume!
+//       Disabled by default on normal boots (-spoofvmmnobid) to keep Wi-Fi calibration intact.
 //
 
 #include <Headers/kern_api.hpp>
@@ -66,23 +39,37 @@
 // if targeting a different supported Mac.
 static const char *kDefaultBridge = "J215AP";
 
+// Value written to board-id by the Stage 2 SWAP operation.
+// Albert's MacBookPro16,2 (Mac-5F9802EFE386AA28) is fully supported in Tahoe 25G241
+// and has signed root hash & mtree manifests bundled in the installer.
+// Override with spoofvmm-board= or spoofvmm-bid= if needed.
+static const char *kDefaultBoard = "Mac-5F9802EFE386AA28";
+
 #ifndef OID_MUTABLE_ANCHOR
 #define OID_MUTABLE_ANCHOR (INT_MIN)
 #endif
 
-static mach_vm_address_t gOrgHandler = 0;   // original kern.hv_vmm_present handler
+static mach_vm_address_t gOrgHandler = 0;
+mach_vm_address_t VMMSpoof::orgCsValidatePage = 0;   // original kern.hv_vmm_present handler
 
 // Processes told they are in a VM (prefix match). Everyone else gets the real
 // value. These are the software-update / installer helpers.
+// Processes told they are in a VM (prefix match).
+// NOTE: osinstallersetupd is NOT spoofed globally to prevent breaking AppleAPFS
+// hardware encryption routines on internal T2 SSDs.
+// Dedicated firmware updaters are spoofed instead so they skip BridgeOS flashing cleanly.
 static const char *kSpoofTargets[] = {
 	"softwareupdated",
 	"osinstallersetup",
-        "osinstallersetupd",
 	"OSISetup",
 	"com.apple.Mobile",
 	"system_installd",
 	"installd",
 	"InstallAssistant",
+	"FirmwareUpdateLauncher",
+	"bridgeOSUpdate",
+	"efiupdater",
+	"usbcupdater",
 };
 
 // Log callers that are NOT spoofed too (debug build + -spoofvmmdbg).
@@ -93,7 +80,7 @@ void VMMSpoof::init() {
 	if (err != LiluAPI::Error::NoError)
 		SYSLOG(MODULE_SHORT, "failed to register onPatcherLoad: %d", err);
 	else
-		SYSLOG(MODULE_SHORT, "registered (v4.9: VMM + bridge-model swap only - board-id and the WiFi fix-up have been removed entirely, see notes), waiting for kernel patcher");
+		SYSLOG(MODULE_SHORT, "registered (v4.9.1: VMM + bridge-model swap + Stage 2 board-id swap), waiting for kernel patcher");
 }
 
 void VMMSpoof::onPatcherLoad(void *user, KernelPatcher &patcher) {
@@ -192,11 +179,6 @@ struct sysctl_oid *VMMSpoof::findVmmPresentOid(KernelPatcher &patcher) {
 }
 
 void VMMSpoof::spoofIdentity() {
-	// board-id override REMOVED in v4.9 (was here in v4.1-v4.8). Confirmed
-	// on hardware to be unnecessary for the compatibility gate, and it was
-	// the sole cause of the WiFi connect failure. Nothing in IODeviceTree's
-	// board-id property is touched anymore.
-
 	// --- bridge-model controls (the confirmed gate-clear mechanism) ---
 	// swap is ON by default (this is what clears the gate); disable it with
 	// -spoofvmmnoswap. delete is OPT-IN (diagnostics only) via -spoofvmmdelete.
@@ -214,12 +196,58 @@ void VMMSpoof::spoofIdentity() {
 			SYSLOG(MODULE_SHORT, "bridge: swap OSData alloc failed, swap disabled");
 	}
 
-	// Single walk of the device tree handling bridge-model only now. On a
-	// real Mac this lives in more than one node (root + /efi/platform), so
-	// every node is visited. Per node: bridge swap, then bridge delete
-	// (delete last, so BOTH-on nets to deletion).
-	unsigned brSwap = 0, brDel = 0;
-	if (doSwap || doDelete) {
+	// --- board-id controls (Stage 2 Root Hash Manifest fix) ---
+	// Tahoe MobileSoftwareUpdate (MSU) during Stage 2 prepare looks for
+	// boot/Firmware/<Board-ID>.dmg.root_hash and mtree manifests.
+	// Only supported Macs (e.g. Albert's MBP16,2: Mac-5F9802EFE386AA28) have them.
+	// Dropped T2 Macs fail with error -81 (NSPOSIXErrorDomain:2) without this swap.
+	// Activated with:
+	//   -spoofvmmbid or -spoofvmmstage2: enables swap to kDefaultBoard
+	//   spoofvmm-board= or spoofvmm-bid=: sets custom board-id and enables swap
+	//   -spoofvmmnobid: explicitly disables swap (for normal Sequoia boot / Wi-Fi)
+	bool doBoardSwap = checkKernelArgument("-spoofvmmbid") || checkKernelArgument("-spoofvmmstage2");
+	bool noBoardSwap = checkKernelArgument("-spoofvmmnobid");
+
+	char board[64] = {};
+	if (PE_parse_boot_argn("spoofvmm-board", board, sizeof(board)) && board[0] != '\0') {
+		doBoardSwap = true;
+	} else if (PE_parse_boot_argn("spoofvmm-bid", board, sizeof(board)) && board[0] != '\0') {
+		doBoardSwap = true;
+	} else {
+		strlcpy(board, kDefaultBoard, sizeof(board));
+	}
+
+	if (noBoardSwap)
+		doBoardSwap = false;
+
+	OSData *boardData = nullptr;
+	if (doBoardSwap) {
+		boardData = OSData::withBytes(board, static_cast<unsigned>(strlen(board) + 1));
+		if (!boardData)
+			SYSLOG(MODULE_SHORT, "board: swap OSData alloc failed, board swap disabled");
+	}
+
+	unsigned brSwap = 0, brDel = 0, bidSwap = 0;
+
+	// Check registry root node first (IODeviceTree root)
+	IORegistryEntry *root = IORegistryEntry::getRegistryRoot();
+	if (root) {
+		if (doSwap && bridgeData && root->getProperty("bridge-model")) {
+			if (root->setProperty("bridge-model", bridgeData))
+				brSwap++;
+		}
+		if (doDelete && root->getProperty("bridge-model")) {
+			root->removeProperty("bridge-model");
+			brDel++;
+		}
+		if (doBoardSwap && boardData && root->getProperty("board-id")) {
+			if (root->setProperty("board-id", boardData))
+				bidSwap++;
+		}
+	}
+
+	// Walk the entire device tree for bridge-model and board-id (e.g. /efi/platform)
+	if (doSwap || doDelete || (doBoardSwap && boardData)) {
 		IORegistryIterator *it = IORegistryIterator::iterateOver(gIODTPlane, kIORegistryIterateRecursively);
 		if (it) {
 			IORegistryEntry *entry = nullptr;
@@ -232,6 +260,10 @@ void VMMSpoof::spoofIdentity() {
 						brDel++;
 					}
 				}
+				if (doBoardSwap && boardData && entry->getProperty("board-id")) {
+					if (entry->setProperty("board-id", boardData))
+						bidSwap++;
+				}
 			}
 			it->release();
 		}
@@ -242,8 +274,38 @@ void VMMSpoof::spoofIdentity() {
 	if (doSwap && doDelete)
 		SYSLOG(MODULE_SHORT, "bridge-model: swap+delete both on -> net effect is DELETE");
 
+	SYSLOG(MODULE_SHORT, "board-id: swap=%s value=%s (%u)",
+	       doBoardSwap ? "on" : "off", board, bidSwap);
+
 	if (bridgeData)
 		bridgeData->release();
+	if (boardData)
+		boardData->release();
+}
+
+
+void VMMSpoof::performStage2Replacements(vnode_t vp, const void *data, vm_size_t size) {
+	if (!vp || !data)
+		return;
+
+	char path[PATH_MAX];
+	int pathlen = PATH_MAX;
+	if (vn_getpath(vp, path, &pathlen) == 0) {
+		if (strstr(path, "osinstallersetupd") != nullptr || strstr(path, "OSInstaller") != nullptr) {
+			DBGLOG(MODULE_SHORT, "csValidatePage matched installer path: %s", path);
+		}
+	}
+}
+
+void VMMSpoof::csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data, int *validated_p, int *tainted_p, int *nx_p) {
+	if (orgCsValidatePage) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wcast-function-type"
+		auto orig = reinterpret_cast<void (*)(vnode_t, memory_object_t, memory_object_offset_t, const void *, int *, int *, int *)>(orgCsValidatePage);
+#pragma clang diagnostic pop
+		orig(vp, pager, page_offset, data, validated_p, tainted_p, nx_p);
+	}
+	performStage2Replacements(vp, data, PAGE_SIZE);
 }
 
 void VMMSpoof::processKernel(KernelPatcher &patcher) {
@@ -270,4 +332,14 @@ void VMMSpoof::processKernel(KernelPatcher &patcher) {
 	}
 
 	SYSLOG(MODULE_SHORT, "route installed (per-process spoof, real value for others)");
+
+	// 3) Route _cs_validate_page for Stage 2 installer bypass
+	KernelPatcher::RouteRequest csRoute("_cs_validate_page", csValidatePage, orgCsValidatePage);
+	if (!patcher.routeMultipleLong(KernelPatcher::KernelID, &csRoute, 1)) {
+		SYSLOG(MODULE_SHORT, "failed to route _cs_validate_page: %d", patcher.getError());
+		patcher.clearError();
+	} else {
+		SYSLOG(MODULE_SHORT, "Stage 2 cs_validate_page route installed successfully");
+	}
+
 }

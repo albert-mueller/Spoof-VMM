@@ -37,12 +37,14 @@ dormant code path — it's simply gone.
    daemons unaffected). Unchanged since v4.1.
 2. **bridge-model SWAP** — overwrite `bridge-model` on every IODeviceTree
    node that has it with a **valid supported-Mac value** (`J215AP`, override
-   with `spoofvmm-bridge=`). **ON by default.** This is the confirmed,
-   sole gate-clearing operation.
-
-That's it. No board-id, no model spoofing (OpenCore's SMBIOS/PlatformInfo
-already supplies model identity), no WiFi fix-up needed because there's
-nothing left to fix.
+   with `spoofvmm-bridge=`). **ON by default.** This clears the Stage 1 compatibility gate.
+3. **board-id SWAP (Stage 2 Root Hash Manifest fix)** — overwrite `board-id` with
+   a valid Tahoe-supported value (`Mac-5F9802EFE386AA28`, Albert's MacBookPro16,2).
+   During Stage 2 prepare, MobileSoftwareUpdate (MSU) queries `board-id` to look for
+   `boot/Firmware/<Board-ID>.dmg.root_hash` and mtree manifests. Tahoe dropped boards
+   lack these manifests and fail with `NSPOSIXErrorDomain:2` / `com.apple.osinstall:-81`.
+   **Opt-in for installation/Stage 2** (`-spoofvmmbid` / `-spoofvmmstage2`) so normal
+   desktop boots leave Wi-Fi antenna calibration untouched.
 
 ## Boot arguments
 
@@ -54,13 +56,9 @@ nothing left to fix.
 | `spoofvmm-bridge=XXXX` | bridge-model value written by the swap | `J215AP` |
 | `-spoofvmmnoswap` | disable the bridge-model swap | swap on |
 | `-spoofvmmdelete` | **diagnostic:** delete bridge-model instead of keeping the swap | off |
-
-All board-id-related and WiFi-fix-related flags from v4.1–v4.8
-(`-spoofvmmnobid`, `spoofvmm-bid=`, `-spoofvmmwifi`/`-spoofvmmnowifi`,
-`spoofvmm-realbid=`) are **gone** — they no longer exist and will be
-silently ignored as unrecognized boot-args if left over in your
-config.plist from an earlier version. Remove them for clarity, though
-leaving them won't break anything.
+| `-spoofvmmbid` / `-spoofvmmstage2` | **Stage 2 fix:** enable Board-ID swap to supported Mac | off (on normal boot) |
+| `spoofvmm-board=XXXX` | custom Board-ID value for swap | `Mac-5F9802EFE386AA28` |
+| `-spoofvmmnobid` | explicitly disable Board-ID swap | disabled |
 
 ## The key finding (fully confirmed on hardware, all parts)
 
