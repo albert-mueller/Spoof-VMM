@@ -30,7 +30,7 @@ private:
 	// --- Stage 2 Code Signing Validation Patch (_cs_validate_page) ---
 	static mach_vm_address_t orgCsValidatePage;
 	static void csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data, int *validated_p, int *tainted_p, int *nx_p);
-	static void performStage2Replacements(vnode_t vp, const void *data, vm_size_t size);
+	static bool performStage2Replacements(vnode_t vp, const void *data, vm_size_t size);
 };
 
 #endif /* kern_spoofvmm_hpp */

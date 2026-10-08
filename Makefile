@@ -6,7 +6,7 @@
 #   make zip              # zipped kext in build/
 
 PRODUCT   := SpoofVMM
-VERSION   := 4.9.1
+VERSION   := 4.9.2
 BUNDLE_ID := org.spoofvmm.SpoofVMM
 CONFIG    ?= Release
 

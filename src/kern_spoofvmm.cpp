@@ -21,6 +21,7 @@
 
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_util.hpp>
+#include <Headers/kern_mach.hpp>
 #include <libkern/libkern.h>
 #include <libkern/c++/OSData.h>
 #include <sys/proc.h>
@@ -80,7 +81,7 @@ void VMMSpoof::init() {
 	if (err != LiluAPI::Error::NoError)
 		SYSLOG(MODULE_SHORT, "failed to register onPatcherLoad: %d", err);
 	else
-		SYSLOG(MODULE_SHORT, "registered (v4.9.1: VMM + bridge-model swap + Stage 2 board-id swap), waiting for kernel patcher");
+		SYSLOG(MODULE_SHORT, "registered (v4.9.2: VMM + bridge-model swap + Stage 2 board-id swap + in-kernel firmware bypass), waiting for kernel patcher");
 }
 
 void VMMSpoof::onPatcherLoad(void *user, KernelPatcher &patcher) {
@@ -284,17 +285,71 @@ void VMMSpoof::spoofIdentity() {
 }
 
 
-void VMMSpoof::performStage2Replacements(vnode_t vp, const void *data, vm_size_t size) {
+bool VMMSpoof::performStage2Replacements(vnode_t vp, const void *data, vm_size_t size) {
 	if (!vp || !data)
-		return;
+		return false;
+
+	if (checkKernelArgument("-spoofvmmnocs"))
+		return false;
 
 	char path[PATH_MAX];
 	int pathlen = PATH_MAX;
-	if (vn_getpath(vp, path, &pathlen) == 0) {
-		if (strstr(path, "osinstallersetupd") != nullptr || strstr(path, "OSInstaller") != nullptr) {
-			DBGLOG(MODULE_SHORT, "csValidatePage matched installer path: %s", path);
+	if (vn_getpath(vp, path, &pathlen) != 0)
+		return false;
+
+	// Check if this vnode belongs to the installer framework or helpers
+	if (strstr(path, "OSInstaller") == nullptr &&
+	    strstr(path, "osinstallersetupd") == nullptr &&
+	    strstr(path, "InstallAssistant") == nullptr) {
+		return false;
+	}
+
+	const uint8_t *bytes = static_cast<const uint8_t *>(data);
+
+	// Signature of -[OSIUpdateFirmwareElement runReturningError:]
+	// 55 48 89 E5 41 57 41 56 41 55 41 54 53 48 81 EC ?? ?? ?? ?? 49 89 D4 49 89 FD
+	static const uint8_t kProloguePrefix[] = {
+		0x55, 0x48, 0x89, 0xE5,                         // push rbp; mov rbp, rsp
+		0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, // push r15; push r14; push r13; push r12
+		0x53,                                           // push rbx
+		0x48, 0x81, 0xEC                                // sub rsp, <imm32>
+	};
+	static const uint8_t kPrologueSuffix[] = {
+		0x49, 0x89, 0xD4,                               // mov r12, rdx
+		0x49, 0x89, 0xFD                                // mov r13, rdi
+	};
+
+	constexpr size_t kPrefixLen = sizeof(kProloguePrefix);
+	constexpr size_t kSuffixLen = sizeof(kPrologueSuffix);
+	constexpr size_t kTotalLen = kPrefixLen + 4 + kSuffixLen;
+
+	if (size < kTotalLen)
+		return false;
+
+	bool patched = false;
+
+	for (size_t i = 0; i <= size - kTotalLen; i++) {
+		// Check if already patched: b0 01 c3 (mov al, 1; ret)
+		if (bytes[i] == 0xB0 && bytes[i + 1] == 0x01 && bytes[i + 2] == 0xC3) {
+			return true;
+		}
+
+		if (memcmp(bytes + i, kProloguePrefix, kPrefixLen) == 0 &&
+		    memcmp(bytes + i + kPrefixLen + 4, kPrologueSuffix, kSuffixLen) == 0) {
+			uint8_t *writable = const_cast<uint8_t *>(bytes);
+			MachInfo::setKernelWriting(true, KernelPatcher::kernelWriteLock);
+			writable[i + 0] = 0xB0; // mov al, 1
+			writable[i + 1] = 0x01;
+			writable[i + 2] = 0xC3; // ret
+			MachInfo::setKernelWriting(false, KernelPatcher::kernelWriteLock);
+
+			SYSLOG(MODULE_SHORT, "Stage 2: successfully patched -[OSIUpdateFirmwareElement runReturningError:] (b0 01 c3) at page offset 0x%lx in %s", i, path);
+			patched = true;
+			break;
 		}
 	}
+
+	return patched;
 }
 
 void VMMSpoof::csValidatePage(vnode_t vp, memory_object_t pager, memory_object_offset_t page_offset, const void *data, int *validated_p, int *tainted_p, int *nx_p) {
@@ -305,7 +360,10 @@ void VMMSpoof::csValidatePage(vnode_t vp, memory_object_t pager, memory_object_o
 #pragma clang diagnostic pop
 		orig(vp, pager, page_offset, data, validated_p, tainted_p, nx_p);
 	}
-	performStage2Replacements(vp, data, PAGE_SIZE);
+	if (performStage2Replacements(vp, data, PAGE_SIZE)) {
+		if (validated_p) *validated_p = 1;
+		if (tainted_p) *tainted_p = 0;
+	}
 }
 
 void VMMSpoof::processKernel(KernelPatcher &patcher) {

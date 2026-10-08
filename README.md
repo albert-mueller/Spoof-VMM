@@ -1,50 +1,13 @@
-# SpoofVMM v4.9
+# SpoofVMM v4.9.2
 
-**Board-id functionality removed entirely — permanently, with no flag needed
-to disable it. The dead WiFi node-restore fix (v4.6/v4.7) is deleted, not
-just turned off. This is the leanest, simplest version of the kext to date.**
-
-## Why
-
-Confirmed on hardware, in order:
-
-1. `ioreg -l -p IODeviceTree | grep -iE board-id` showed only **two**
-   `board-id` properties exist anywhere in the entire IODeviceTree plane
-   (root, `/efi/platform`) — the WiFi controller's own node has none of its
-   own. This made v4.6 (hook on `AirPortBrcmNIC`) and v4.7 (hook on
-   `IOSkywalkFamily`, testing a timing hypothesis) both structurally
-   incapable of working, regardless of hook point.
-2. A full `ioreg -l -p IODeviceTree | grep -B5 -A25 -i "pci14e4"` diff
-   between a stock no-kext boot (WiFi working) and a SpoofVMM-active boot
-   (WiFi broken) showed the WiFi PCI device's own properties are
-   byte-for-byte identical in both states. Nothing local to the WiFi node
-   changes — ruling out a WiFi-node-level cause entirely and pointing at the
-   shared root-level `board-id` as the only remaining candidate.
-3. **v4.8's `-spoofvmmnobid` flag, tested on hardware with board-id left
-   completely untouched (confirmed via terminal — the real MacBookAir8,1
-   board-id was present): the compatibility gate still cleared.** Board-id
-   spoofing was never necessary for the gate. The original finding ("gate
-   keys off bridge-model, not board-id") was correct all along — board-id
-   spoofing was pure WiFi-breaking collateral damage with zero benefit.
-
-So as of v4.9: board-id is never touched, period. No flag, no option, no
-dormant code path — it's simply gone.
+**macOS Tahoe Stage 2 Firmware & Root Hash Manifest Fix for dropped T2 Macs (2018–2019). Includes scoped per-process VMM spoofing, bridge-model swap, opt-in Stage 2 Board-ID swap, and in-kernel code validation bypass for `OSIUpdateFirmwareElement`.**
 
 ## What it does
 
-1. **`kern.hv_vmm_present = 1`, per process** — `1` only to the
-   software-update / installer helpers, real value to everyone else (disk
-   daemons unaffected). Unchanged since v4.1.
-2. **bridge-model SWAP** — overwrite `bridge-model` on every IODeviceTree
-   node that has it with a **valid supported-Mac value** (`J215AP`, override
-   with `spoofvmm-bridge=`). **ON by default.** This clears the Stage 1 compatibility gate.
-3. **board-id SWAP (Stage 2 Root Hash Manifest fix)** — overwrite `board-id` with
-   a valid Tahoe-supported value (`Mac-5F9802EFE386AA28`, Albert's MacBookPro16,2).
-   During Stage 2 prepare, MobileSoftwareUpdate (MSU) queries `board-id` to look for
-   `boot/Firmware/<Board-ID>.dmg.root_hash` and mtree manifests. Tahoe dropped boards
-   lack these manifests and fail with `NSPOSIXErrorDomain:2` / `com.apple.osinstall:-81`.
-   **Opt-in for installation/Stage 2** (`-spoofvmmbid` / `-spoofvmmstage2`) so normal
-   desktop boots leave Wi-Fi antenna calibration untouched.
+1. **`kern.hv_vmm_present = 1`, per process** — `1` only to software-update / installer helpers (`softwareupdated`, `com.apple.Mobile`, etc.), real bare-metal value to everyone else so APFS disk crypto and Secure Enclave remain unaffected.
+2. **bridge-model SWAP** — overwrite `bridge-model` on every IODeviceTree node that has it with a **valid supported-Mac value** (`J215AP`, override with `spoofvmm-bridge=`). **ON by default.** This clears the Stage 1 compatibility gate.
+3. **board-id SWAP (Stage 2 Root Hash Manifest fix)** — overwrite `board-id` with a valid Tahoe-supported value (`Mac-5F9802EFE386AA28`, Albert's MacBookPro16,2). During Stage 2 prepare, MobileSoftwareUpdate (MSU) queries `board-id` to look for `boot/Firmware/<Board-ID>.dmg.root_hash` and mtree manifests. Tahoe dropped boards lack these manifests and fail with `NSPOSIXErrorDomain:2` / `com.apple.osinstall:-81`. **Opt-in for installation/Stage 2** (`-spoofvmmbid` / `-spoofvmmstage2`) so normal desktop boots leave Wi-Fi antenna calibration untouched.
+4. **In-Kernel Stage 2 Firmware Bypass (`_cs_validate_page`)** — intercepts binary code pages for `OSInstaller.framework` and `osinstallersetupd` at the kernel validation boundary. Binary-patches the entry point of `-[OSIUpdateFirmwareElement runReturningError:]` with `b0 01 c3` (`mov al, 1; ret`) so BridgeOS firmware verification succeeds automatically without userland dylibs or SIP modifications.
 
 ## Boot arguments
 
@@ -52,13 +15,14 @@ dormant code path — it's simply gone.
 |-----|--------|---------|
 | `-spoofvmmoff` | disable the plugin entirely | — |
 | `-spoofvmmdbg` | debug logging (Debug build only) | — |
-| `-spoofvmmbeta` | allow loading outside the Tahoe kernel range (needed to test on Sonoma) | — |
+| `-spoofvmmbeta` | allow loading outside the Tahoe kernel range | — |
 | `spoofvmm-bridge=XXXX` | bridge-model value written by the swap | `J215AP` |
 | `-spoofvmmnoswap` | disable the bridge-model swap | swap on |
 | `-spoofvmmdelete` | **diagnostic:** delete bridge-model instead of keeping the swap | off |
 | `-spoofvmmbid` / `-spoofvmmstage2` | **Stage 2 fix:** enable Board-ID swap to supported Mac | off (on normal boot) |
 | `spoofvmm-board=XXXX` | custom Board-ID value for swap | `Mac-5F9802EFE386AA28` |
 | `-spoofvmmnobid` | explicitly disable Board-ID swap | disabled |
+| `-spoofvmmnocs` | disable `_cs_validate_page` in-kernel installer binary patch | patch on |
 
 ## The key finding (fully confirmed on hardware, all parts)
 
